@@ -28,8 +28,17 @@ class Enquadrador:
                 break
             linha = bytes(self._buf[:fim])
             del self._buf[: fim + 1]
-            if linha.strip():
-                mensagens.append(json.loads(linha.decode("utf-8")))
+            if not linha.strip():
+                continue
+
+            mensagem = json.loads(linha.decode("utf-8"))
+            # `[1,2,3]`, `"texto"` e `null` são JSON válido mas não são mensagem.
+            # Sem este teste, o primeiro acesso a `.get("tipo")` levantava
+            # AttributeError e derrubava o laço de eventos inteiro — um cliente
+            # mandando um único byte de lixo tirava o servidor do ar.
+            if not isinstance(mensagem, dict):
+                raise ValueError(f"mensagem não é objeto JSON: {type(mensagem).__name__}")
+            mensagens.append(mensagem)
 
         if len(self._buf) > LIMITE_BUFFER:
             raise BufferExcedido(

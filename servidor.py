@@ -39,7 +39,8 @@ class Servidor:
     def __init__(self, nome: str, host: str, porta: int, palavras: list[str],
                  prazo_reconexao: float = PRAZO_RECONEXAO,
                  par: tuple[str, int] | None = None,
-                 porta_replicacao: int | None = None):
+                 porta_replicacao: int | None = None,
+                 ip_par: str | None = None):
         self.nome = nome
         self.host = host
         self.porta = porta
@@ -58,6 +59,7 @@ class Servidor:
         self.ultimo_lance: dict[int, int] = {}
 
         self.porta_replicacao = porta_replicacao
+        self.ip_par = ip_par
         self.replicador = (
             Replicador(par[0], par[1], log=lambda m: self._log(f"[repl] {m}"))
             if par else None
@@ -421,10 +423,23 @@ class Servidor:
         }
 
     def _aplicar_instantaneo(self, d: dict):
-        self.sala.aplicar_dict(d["sala"])
-        self.partida = Partida.de_dict(d["partida"]) if d["partida"] else None
-        self.dupla = tuple(d["dupla"]) if d["dupla"] else None
-        self.ultimo_lance = {int(k): v for k, v in d["ultimo_lance"].items()}
+        """Aplica o estado recebido do primário — ou nada.
+
+        Tudo é construído em variáveis locais antes de qualquer atribuição: um
+        instantâneo truncado ou corrompido levanta a exceção *antes* de tocar o
+        estado real, e o backup continua com o último estado válido em vez de
+        ficar meio atualizado.
+        """
+        nova_sala = Sala(prazo_reconexao=self.sala.prazo_reconexao)
+        nova_sala.aplicar_dict(d["sala"])
+        nova_partida = Partida.de_dict(d["partida"]) if d.get("partida") else None
+        nova_dupla = tuple(d["dupla"]) if d.get("dupla") else None
+        novo_lance = {int(k): v for k, v in (d.get("ultimo_lance") or {}).items()}
+
+        self.sala = nova_sala
+        self.partida = nova_partida
+        self.dupla = nova_dupla
+        self.ultimo_lance = novo_lance
 
     def _replicar(self):
         """Empurra o estado para o backup ANTES de confirmar ao cliente.
@@ -487,6 +502,28 @@ class Servidor:
 
     def _aceitar_replica(self, ouvinte):
         sock, endereco = ouvinte.accept()
+
+        # Só o primário configurado entra. Sem este teste, qualquer um na rede
+        # conectava aqui, era aceito como primário, o canal verdadeiro era
+        # descartado, e ao morrer essa conexão o backup concluía que o primário
+        # havia caído — e DESLIGAVA a máquina saudável pelo fencing. Lixo numa
+        # linha derrubava fisicamente o servidor bom.
+        if self.ip_par and endereco[0] != self.ip_par:
+            self._log(f"[repl] conexão de {endereco[0]} recusada "
+                      f"(só {self.ip_par} pode replicar)")
+            sock.close()
+            return
+
+        # Defesa em profundidade: um canal que deu sinal de vida agora há pouco não
+        # é substituído. Mesmo vindo do endereço certo, ninguém desloca o canal ativo.
+        if self.replica is not None and self.ultimo_contato_par is not None:
+            silencio = time.monotonic() - self.ultimo_contato_par
+            if silencio < JANELA_DETECCAO_PAR:
+                self._log(f"[repl] conexão de {endereco[0]} recusada: canal atual "
+                          f"deu sinal há {silencio:.1f}s")
+                sock.close()
+                return
+
         sock.setblocking(False)
         if self.replica is not None:
             self._log("[repl] primário reconectou, descartando canal antigo")
@@ -532,7 +569,20 @@ class Servidor:
 
         for m in mensagens:
             if m.get("tipo") == "estado":
-                self._aplicar_instantaneo(m["dados"])
+                # A porta de replicação não tem autenticação, então qualquer um na
+                # rede alcança este caminho. Um `{"tipo":"estado"}` sem a chave
+                # `dados` derrubava o servidor inteiro com uma linha.
+                try:
+                    dados = m["dados"]
+                    if not isinstance(dados, dict):
+                        raise ValueError(f"'dados' não é objeto: {type(dados).__name__}")
+                    self._aplicar_instantaneo(dados)
+                except (KeyError, TypeError, ValueError, AttributeError) as erro:
+                    self._log(f"[repl] estado inválido descartado "
+                              f"({type(erro).__name__}: {erro})")
+                    self._fechar_replica()
+                    return
+
             try:
                 conexao.sock.sendall(empacotar({"tipo": "ok", "seq": m.get("seq")}))
             except OSError:
@@ -621,6 +671,9 @@ def main():
                         help="endereço de replicação do backup (quem passa isto é o primário)")
     parser.add_argument("--porta-replicacao", type=int,
                         help="porta onde receber estado do primário (quem passa isto é o backup)")
+    parser.add_argument("--ip-par", metavar="IP",
+                        help="único endereço aceito na porta de replicação; sem isto, "
+                             "qualquer um na rede pode se passar pelo primário")
     parser.add_argument("--agente-fencing", metavar="HOST:PORTA",
                         help="agente de fencing no host; habilita promoção automática")
     parser.add_argument("--vm-par", default="VM1",
@@ -638,7 +691,7 @@ def main():
 
     servidor = Servidor(args.nome, args.host, args.porta,
                         carregar_palavras(args.palavras), args.prazo_reconexao,
-                        par, args.porta_replicacao)
+                        par, args.porta_replicacao, args.ip_par)
 
     if args.agente_fencing:
         host, _, porta = args.agente_fencing.rpartition(":")

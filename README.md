@@ -63,19 +63,32 @@ desligamento, e o split-brain deixa de ser teórico:
 python infra\agente_fencing.py --host 192.168.56.1 --porta 5010
 ```
 
-**2. Backup (VM2):**
+**2. Backup (VM2)** — entre na VM primeiro, pelo PowerShell:
 
-```bash
-python3 servidor.py --nome VM2 --porta 5000 --porta-replicacao 5001 \
-  --agente-fencing 192.168.56.1:5010 --vm-par VM1 \
-  --ip-virtual 192.168.56.10/24 --interface proj0
+```powershell
+ssh -i "$env:USERPROFILE\.ssh\forca_vm" aluno@192.168.56.12
 ```
 
-**3. Primário (VM1):**
+E **dentro da VM**, em uma linha (o `\` de continuação é do bash e quebra se você
+colar isso no PowerShell):
 
 ```bash
-sudo -n ./infra/assumir_ip.sh 192.168.56.10/24 proj0
-python3 servidor.py --nome VM1 --porta 5000 --par 192.168.56.12:5001
+cd ~/JogoDaForca && python3 servidor.py --nome VM2 --porta 5000 --porta-replicacao 5001 --ip-par 192.168.56.11 --agente-fencing 192.168.56.1:5010 --vm-par VM1 --ip-virtual 192.168.56.10/24 --interface proj0
+```
+
+`--ip-par` não é opcional na prática: sem ele, qualquer um na rede conecta na porta
+de replicação, se passa pelo primário, e ao cair faz o backup desligar a máquina
+saudável pelo fencing.
+
+**3. Primário (VM1)** — outra janela:
+
+```powershell
+ssh -i "$env:USERPROFILE\.ssh\forca_vm" aluno@192.168.56.11
+```
+
+```bash
+sudo -n ~/JogoDaForca/infra/assumir_ip.sh 192.168.56.10/24 proj0
+cd ~/JogoDaForca && python3 servidor.py --nome VM1 --porta 5000 --par 192.168.56.12:5001
 ```
 
 **4. Clientes, no host:**
