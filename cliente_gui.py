@@ -136,7 +136,6 @@ class JanelaForca(QMainWindow):
         self.ultimo_contato = 0.0
         self.proxima_tentativa = 0.0
         self.conectado = False
-        self.deslocado = False
 
         self.meu_id = None
         self.servidor_atual = None
@@ -155,7 +154,11 @@ class JanelaForca(QMainWindow):
         self.relogio_prazo = 0.0
 
         pasta = Path(tempfile.gettempdir())
-        base = f"forca-{nome}-{host}-{porta}"
+        # O nome entra em nome de arquivo. Com `\`, `:` ou `..` ele escreveria
+        # fora da pasta temporária, ou o open falharia calado e a sessão nunca
+        # seria salva.
+        seguro = "".join(c for c in nome if c.isalnum() or c in "-_") or "jogador"
+        base = f"forca-{seguro}-{host}-{porta}"
         self.arquivo_token = pasta / f"{base}.token"
         self.arquivo_trava = pasta / f"{base}.lock"
         self._trava = None
@@ -165,6 +168,7 @@ class JanelaForca(QMainWindow):
             self._esquecer_token()
 
         self._montar()
+        self._travar_texto_plano()
         self._ligar_teclado()
         if not self.exclusivo:
             self._avisar(f"já existe um cliente '{nome}' nesta máquina — "
@@ -441,14 +445,15 @@ class JanelaForca(QMainWindow):
             f" color: {RUIM if apertado else APAGADO};")
 
     def _mostrar_resultado(self, e: dict):
-        venceu = e.get("vencedor") == e["voce"]
+        venceu = e.get("vencedor") == e.get("voce")
         self.lbl_res_titulo.setText("VOCÊ VENCEU!" if venceu else "VOCÊ PERDEU")
         self.lbl_res_titulo.setStyleSheet(
             f"font-size: 30pt; font-weight: 700; letter-spacing: 3px;"
             f" color: {BOM if venceu else RUIM};")
         self.lbl_res_palavra.setText(e.get("palavra") or "?")
         self.lbl_res_placar.setText("     ".join(
-            f"{j['nome']}  {j['erros']}/{e['max_erros']} erros" for j in e["jogadores"]))
+            f"{j.get('nome', '?')}  {j.get('erros', 0)}/{e.get('max_erros', MAX_ERROS)} erros"
+            for j in (e.get("jogadores") or [])))
 
         self.mostrando_resultado = True
         self.segundos_resultado = 12
@@ -471,6 +476,18 @@ class JanelaForca(QMainWindow):
         self.pilha.setCurrentIndex(0)
         if self.estado_sala:
             self._mostrar_sala(self.estado_sala)
+
+    def _travar_texto_plano(self):
+        """Nenhum rótulo interpreta marcação.
+
+        QLabel nasce em AutoText e desenha HTML quando o texto parece HTML.
+        Como nome de jogador, aviso e palavra vêm todos da rede, um
+        `<img src=http://x/y>` viraria uma requisição feita pelo meu cliente.
+        O servidor já sanitiza o nome; isto aqui é a segunda tranca, para o
+        caso de o servidor do outro lado não ser o nosso.
+        """
+        for etiqueta in self.findChildren(QLabel):
+            etiqueta.setTextFormat(Qt.TextFormat.PlainText)
 
     # ------------------------------------------------------------ teclado
     def _ligar_teclado(self):
@@ -549,7 +566,6 @@ class JanelaForca(QMainWindow):
         agora = time.monotonic()
         if not self.conectado:
             if agora >= self.proxima_tentativa:
-                self.deslocado = False
                 self._conectar()
             return
 
@@ -560,7 +576,17 @@ class JanelaForca(QMainWindow):
                     self._cair("servidor fechou")
                     return
                 for m in self.enquadrador.alimentar(dados):
-                    self._tratar(m)
+                    try:
+                        self._tratar(m)
+                    except Exception as erro:
+                        # Exceção que escapa de um slot do Qt não vira erro na
+                        # tela: vira abort do processo, e a janela some sem dizer
+                        # nada. Mensagem que eu não sei ler é mensagem
+                        # descartada, e o aviso deixa isso visível em vez de
+                        # silencioso.
+                        self._avisar(
+                            f"mensagem do servidor ignorada "
+                            f"({type(erro).__name__}: {erro})", ALERTA)
         except BlockingIOError:
             pass
         except (OSError, ValueError, BufferExcedido) as erro:
@@ -587,8 +613,8 @@ class JanelaForca(QMainWindow):
                 self._piscar()
 
         if tipo == "sessao":
-            self._salvar_token(m["token"])
-            self.meu_id = m["id"]
+            self._salvar_token(m.get("token") or "")
+            self.meu_id = m.get("id")
             atribuido = m.get("nome")
             if atribuido and atribuido != self.nome:
                 self._avisar(f"o nome '{self.nome}' já estava em uso — "
@@ -606,8 +632,10 @@ class JanelaForca(QMainWindow):
 
         elif tipo == "substituido":
             self._avisar(f"{m.get('msg')} — vou entrar como jogador novo", ALERTA)
+            # Esquecer o token é o que quebra o laço de expulsão: sem ele
+            # as duas conexões reconectam com a mesma identidade e se
+            # derrubam em turnos, uma vez por segundo.
             self._esquecer_token()
-            self.deslocado = True
 
         elif tipo == "sala":
             self.estado_sala = m
@@ -615,6 +643,10 @@ class JanelaForca(QMainWindow):
 
         elif tipo == "estado":
             aceito = m.get("meu_lance")
+            # Confere o tipo: um instantâneo hostil pode plantar qualquer coisa
+            # em ultimo_lance, e o servidor devolve isso aqui como meu_lance.
+            if isinstance(aceito, bool) or not isinstance(aceito, int):
+                aceito = None
             if aceito is not None and aceito >= self.proximo_lance:
                 self.proximo_lance = aceito + 1
             if self.lance_pendente is not None:
@@ -647,11 +679,14 @@ class JanelaForca(QMainWindow):
                    "convidado": "foi convidado", "na_fila": "na fila",
                    "jogando": "em partida", "suspenso": "caiu, aguardando"}
 
-        self.tabela.setRowCount(len(s["jogadores"]))
-        for linha, j in enumerate(s["jogadores"]):
-            eu = j["id"] == s["voce"]
-            valores = (str(j["id"]), j["nome"] + ("   ← você" if eu else ""),
-                       legivel.get(j["estado"], j["estado"]))
+        jogadores = s.get("jogadores") or []
+        self.tabela.setRowCount(len(jogadores))
+        for linha, j in enumerate(jogadores):
+            eu = j.get("id") == s.get("voce")
+            estado = j.get("estado") or "?"
+            valores = (str(j.get("id", "?")),
+                       str(j.get("nome") or "?") + ("   ← você" if eu else ""),
+                       legivel.get(estado, estado))
             for col, txt in enumerate(valores):
                 item = QTableWidgetItem(txt)
                 if eu:
@@ -666,18 +701,18 @@ class JanelaForca(QMainWindow):
             partes.append("uma partida está em andamento — aguarde o slot liberar")
         self.lbl_fila.setText("      ".join(partes))
 
-        convite = s.get("convite")
-        recebido = bool(convite and convite["direcao"] == "recebido")
+        convite = s.get("convite") or None
+        recebido = bool(convite and convite.get("direcao") == "recebido")
         self.bt_aceitar.setEnabled(recebido)
         self.bt_recusar.setEnabled(recebido)
         self.bt_convidar.setEnabled(s.get("seu_estado") == "avulso")
 
         if recebido:
-            self._avisar(f"{convite['nome']} te convidou — "
-                         f"{convite['faltam']}s para responder", DESTAQUE)
+            self._avisar(f"{convite.get('nome', '?')} te convidou — "
+                         f"{convite.get('faltam', '?')}s para responder", DESTAQUE)
         elif convite:
-            self._avisar(f"aguardando resposta de {convite['nome']} "
-                         f"({convite['faltam']}s)", APAGADO)
+            self._avisar(f"aguardando resposta de {convite.get('nome', '?')} "
+                         f"({convite.get('faltam', '?')}s)", APAGADO)
 
     def _mostrar_partida(self, e: dict):
         # Uma partida nova manda na tela. Sem apagar a flag, a contagem regressiva
@@ -685,18 +720,20 @@ class JanelaForca(QMainWindow):
         # no meio do jogo novo.
         self.mostrando_resultado = False
         self.pilha.setCurrentIndex(1)
-        jogadores = e["jogadores"]
+        jogadores = e.get("jogadores") or []
+        max_erros = e.get("max_erros", MAX_ERROS)
 
         for lado, j in enumerate(jogadores[:2]):
-            eu = j["id"] == e["voce"]
+            eu = j.get("id") == e.get("voce")
             self.lbl_jogador[lado].setText(
-                f"{j['nome']}{'  (você)' if eu else ''}     {j['erros']}/{e['max_erros']}")
+                f"{j.get('nome', '?')}{'  (você)' if eu else ''}"
+                f"     {j.get('erros', 0)}/{max_erros}")
             self.lbl_jogador[lado].setStyleSheet(
                 f"font-size: 13pt; font-weight: 600; "
                 f"color: {DESTAQUE if eu else TEXTO};")
-            self.forcas[lado].definir(j["erros"])
+            self.forcas[lado].definir(j.get("erros", 0))
 
-        self.lbl_palavra.setText(e["painel"] or "")
+        self.lbl_palavra.setText(e.get("painel") or "")
         self.relogio_falta = e.get("falta_jogada")
         self.relogio_desde = time.monotonic()
         self.relogio_prazo = e.get("prazo_jogada") or 0
@@ -708,7 +745,7 @@ class JanelaForca(QMainWindow):
         usadas = set(e.get("chutadas") or [])
         revelado = set(normalizar((e.get("painel") or "").replace(" ", "")))
         minha_vez = (not e.get("encerrada") and not e.get("suspensa")
-                     and e.get("turno") == e["voce"])
+                     and e.get("turno") == e.get("voce"))
 
         for letra, b in self.botoes_letra.items():
             b.setEnabled(minha_vez and letra not in usadas)
@@ -721,7 +758,7 @@ class JanelaForca(QMainWindow):
                 b.setStyleSheet("")
 
         if e.get("encerrada"):
-            venceu = e.get("vencedor") == e["voce"]
+            venceu = e.get("vencedor") == e.get("voce")
             self.lbl_turno.setText(
                 ("VOCÊ VENCEU!" if venceu else "você perdeu.")
                 + f"     a palavra era {e.get('palavra')}")
@@ -738,7 +775,8 @@ class JanelaForca(QMainWindow):
             self.lbl_turno.setStyleSheet(
                 f"font-size: 14pt; font-weight: 600; color: {BOM};")
         else:
-            outro = next((j["nome"] for j in jogadores if j["id"] == e["turno"]), "?")
+            outro = next((j.get("nome", "?") for j in jogadores
+                          if j.get("id") == e.get("turno")), "?")
             self.lbl_turno.setText(f"aguardando {outro}...")
             self.lbl_turno.setStyleSheet(
                 f"font-size: 14pt; font-weight: 600; color: {APAGADO};")

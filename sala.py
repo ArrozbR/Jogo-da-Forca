@@ -193,10 +193,13 @@ class Sala:
                     j.estado = AVULSO
             return True, "convite recusado", None
 
-        # Se o convidante caiu entre o convite e a resposta, não há dupla a formar.
-        if convidante is None:
-            if convidado:
-                convidado.estado = AVULSO
+        # Se qualquer um dos dois caiu entre o convite e a resposta, não há dupla
+        # a formar. A guarda era só do convidante; faltando o convidado, a linha
+        # seguinte fazia AttributeError em None.
+        if convidante is None or convidado is None:
+            for j in (convidante, convidado):
+                if j:
+                    j.estado = AVULSO
             return False, "quem convidou saiu da sala", None
 
         convidante.estado = NA_FILA

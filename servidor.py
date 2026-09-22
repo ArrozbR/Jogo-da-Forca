@@ -19,6 +19,22 @@ PRAZO_JOGADA = 180.0        # 3 min para chutar, senão perde a partida
 JANELA_DETECCAO_PAR = 6.0   # 3 batidas perdidas, igual à do cliente
 
 
+def limpar_nome(bruto) -> str:
+    """Deixa passar só o que é seguro exibir, e garante que sobre alguma coisa.
+
+    O nome vai parar na tela do adversário, e o QLabel do Qt usa AutoText: ele
+    INTERPRETA marcação. Um jogador chamado `<img src=http://x/y>` fazia o
+    cliente do outro buscar aquela URL sozinho. Cortar em 20 caracteres não
+    resolvia — cabia folgado.
+
+    isalnum() e não [a-z]: acento e ç são nome de gente, e precisam passar.
+    """
+    limpo = "".join(c for c in str(bruto or "") if c.isalnum() or c in " -_")
+    # Colapsa espaços e apara as pontas: "   " virava um jogador de linha em
+    # branco na sala, impossível de convidar porque não dava para vê-lo.
+    return " ".join(limpo.split())[:20] or "anônimo"
+
+
 class Conexao:
     def __init__(self, sock, endereco):
         self.sock = sock
@@ -169,7 +185,7 @@ class Servidor:
                       "depois de replicar")
             self._enviar(conexao, {"tipo": "aviso", "msg": "falha armada"})
         elif tipo == "entrar":
-            self._entrar(conexao, str(mensagem.get("nome") or "anônimo")[:20])
+            self._entrar(conexao, limpar_nome(mensagem.get("nome")))
         elif tipo == "reconectar":
             self._reconectar(conexao, str(mensagem.get("token") or ""))
         elif tipo == "convidar":
@@ -282,6 +298,13 @@ class Servidor:
             self._enviar(conexao, {"tipo": "erro", "msg": "entre antes de chutar"})
             return
 
+        # O lance volta ao cliente como `meu_lance`, e lá é comparado com >=.
+        # Aceitar qualquer tipo aqui plantava um TypeError na outra ponta —
+        # e no Qt isso não é um erro na tela, é a janela fechando.
+        if lance is not None and (isinstance(lance, bool) or not isinstance(lance, int)):
+            self._enviar(conexao, {"tipo": "erro", "msg": "lance deve ser inteiro"})
+            return
+
         # Reenvio do mesmo lance. Acontece quando o primário replicou e morreu
         # antes de confirmar: o cliente não soube se o chute valeu e manda de
         # novo. Sem este teste, o backup contaria o chute duas vezes.
@@ -357,9 +380,29 @@ class Servidor:
         )
 
     def _sou_quem_atende(self) -> bool:
-        """Primário, ou backup já promovido. O backup em espera não cobra prazo
-        nenhum: quem manda no jogo é quem está com os clientes."""
-        return self.promotor is None or self.promotor.promovido
+        """Cobra prazo quem é dono do estado, e não quem tem uma cópia.
+
+        Dono é quem não está sendo alimentado por ninguém AGORA. Enquanto um
+        primário empurra estado para cá, o relógio que vale é o dele: cobrar
+        aqui também encerraria partidas na cópia enquanto o primário segue
+        jogando, e a próxima mensagem dele desfaria isso — divergência visível.
+
+        Duas respostas erradas que eu já dei aqui, as duas por perguntar a
+        coisa errada:
+
+        - `promotor is None`: verdadeiro num backup sem `--agente-fencing`,
+          que é justamente um backup. Exatamente o contrário do pretendido.
+        - `porta_replicacao is None`: escutar a porta não é ser cópia. Um
+          servidor pode escutá-la e ser o único no ar — e aí ele parava de
+          vencer convite, de anular partida e de cobrar a jogada.
+
+        A pergunta certa é sobre o canal, não sobre a configuração: existe um
+        primário conectado neste instante? Se o canal cai, ou se esta máquina
+        foi promovida, o dono do estado passa a ser esta aqui.
+        """
+        if self.promotor is not None and self.promotor.promovido:
+            return True
+        return self.replica is None
 
     def _cobrar_jogada(self):
         """Desconta o relógio da vez e encerra a partida se ele zerar.
@@ -376,7 +419,7 @@ class Servidor:
         decorrido = agora - self.ultimo_tique
         self.ultimo_tique = agora
 
-        if not self._sou_quem_atende() or self.partida is None:
+        if not self._sou_quem_atende() or self.partida is None or not self.dupla:
             return
         if self.falta_jogada is None or self._suspensa():
             return
@@ -400,6 +443,11 @@ class Servidor:
         self._dissolver_partida()
 
     def _cobrar_prazos(self):
+        # Mesma regra do relógio da jogada: um backup em espera não vence
+        # convite nem anula partida por reconexão. O estado dele é cópia, e
+        # quem manda no prazo é quem mandou a cópia.
+        if not self._sou_quem_atende():
+            return
         mudou = False
 
         for de, para in self.sala.expirar():
@@ -505,7 +553,23 @@ class Servidor:
         nova_partida = Partida.de_dict(d["partida"]) if d.get("partida") else None
         nova_dupla = tuple(d["dupla"]) if d.get("dupla") else None
         novo_lance = {int(k): v for k, v in (d.get("ultimo_lance") or {}).items()}
+
+        # Validar aqui, e não na hora de usar. Este método roda dentro de um try
+        # que descarta o instantâneo inteiro; um campo torto que passe daqui só
+        # estoura no laço de eventos, onde ninguém o pega e o servidor morre.
         nova_falta = d.get("falta_jogada")
+        if nova_falta is not None and (isinstance(nova_falta, bool)
+                                       or not isinstance(nova_falta, (int, float))):
+            raise ValueError(f"falta_jogada não é número: {type(nova_falta).__name__}")
+
+        if nova_partida is not None:
+            if nova_dupla is None or len(nova_dupla) != 2:
+                raise ValueError("partida sem dupla de dois jogadores")
+            # `_estado_partida` lê partida.erros[i] para cada i da dupla: dupla
+            # e partida vindo de origens diferentes daria KeyError na primeira
+            # transmissão.
+            if set(nova_dupla) != set(nova_partida.erros):
+                raise ValueError("dupla não corresponde aos jogadores da partida")
 
         self.sala = nova_sala
         self.partida = nova_partida
@@ -729,7 +793,15 @@ def carregar_palavras(caminho: Path) -> list[str]:
     # BOM, e o marcador entraria como se fosse a primeira letra da primeira
     # palavra — a partida começaria com um caractere invisível no painel.
     linhas = caminho.read_text(encoding="utf-8-sig").splitlines()
-    return [linha.strip() for linha in linhas if linha.strip()]
+    # Sem letra nenhuma a palavra já nasce completa e a partida acabaria no
+    # primeiro chute, com vitória de quem chutasse qualquer coisa.
+    palavras = [p.strip() for p in linhas if any(c.isalpha() for c in p)]
+    if not palavras:
+        raise SystemExit(
+            f"{caminho}: nenhuma palavra utilizável. Recusando subir — sem isto "
+            f"o servidor aceitaria jogadores e só cairia na primeira partida."
+        )
+    return palavras
 
 
 def main():

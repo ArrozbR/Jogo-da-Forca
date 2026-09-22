@@ -20,11 +20,16 @@ import json
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 VBOXMANAGE = Path(r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe")
 PERMITIDAS = {"VM1", "VM2"}
+
+# Curto de propósito. Este é o prazo para o pedido CHEGAR, não para a VM
+# morrer: quem conecta e não fala nada solta a linha em 5s em vez de 30.
+TIMEOUT_PEDIDO = 5.0
 
 
 def log(texto: str):
@@ -62,9 +67,13 @@ def desligar(nome: str) -> tuple[bool, str]:
     return False, f"não confirmou o desligamento (estado: {estado_da_vm(nome)})"
 
 
-def atender(conexao: socket.socket, endereco):
-    conexao.settimeout(30)
+def atender(conexao: socket.socket, endereco, permitidos=None):
+    conexao.settimeout(TIMEOUT_PEDIDO)
     try:
+        if permitidos and endereco[0] not in permitidos:
+            log(f"{endereco[0]} recusado (fora da lista permitida)")
+            return
+
         bruto = b""
         while b"\n" not in bruto and len(bruto) < 4096:
             pedaco = conexao.recv(1024)
@@ -78,7 +87,10 @@ def atender(conexao: socket.socket, endereco):
         log(f"{endereco[0]} pediu '{acao}' em '{alvo}'")
 
         if acao == "estado":
-            ok, motivo = True, estado_da_vm(alvo) if alvo in PERMITIDAS else "negado"
+            # Os parênteses importam: sem eles o `if` valia só para o segundo
+            # item da tupla e `ok` saía True mesmo para uma VM negada.
+            ok = alvo in PERMITIDAS
+            motivo = estado_da_vm(alvo) if ok else "vm fora da lista permitida"
         else:
             ok, motivo = desligar(alvo)
 
@@ -101,6 +113,9 @@ def main():
     parser.add_argument("--host", default="192.168.56.1",
                         help="endereço host-only do Windows")
     parser.add_argument("--porta", type=int, default=5010)
+    parser.add_argument("--ip-permitido", action="append", metavar="IP",
+                        help="só aceita pedidos destes endereços; repita para "
+                             "vários. Sem isto, qualquer um na rede desliga VMs.")
     args = parser.parse_args()
 
     if not VBOXMANAGE.exists():
@@ -111,12 +126,21 @@ def main():
     ouvinte.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     ouvinte.bind((args.host, args.porta))
     ouvinte.listen()
-    log(f"ouvindo em {args.host}:{args.porta} — vms permitidas: {sorted(PERMITIDAS)}")
+    permitidos = set(args.ip_permitido or [])
+    log(f"ouvindo em {args.host}:{args.porta} — vms permitidas: {sorted(PERMITIDAS)}"
+        + (f", origens: {sorted(permitidos)}" if permitidos else ""))
 
     try:
         while True:
             conexao, endereco = ouvinte.accept()
-            atender(conexao, endereco)
+            # Uma thread por pedido. Atendendo em série, dentro do próprio laço
+            # de accept, bastava UMA conexão calada para o agente parar de
+            # responder — e um dispositivo de fencing que não responde é lido
+            # pelo backup como "não consegui confirmar a morte", que é
+            # justamente a porta de entrada do split-brain.
+            threading.Thread(target=atender,
+                             args=(conexao, endereco, permitidos),
+                             daemon=True).start()
     except KeyboardInterrupt:
         print()
     finally:

@@ -3,7 +3,14 @@ import socket
 import subprocess
 import time
 
-TIMEOUT_AGENTE = 5.0
+# Dois prazos, e não um. "Não alcanço o agente" tem de falhar rápido, senão o
+# takeover fica parado esperando uma máquina que sumiu. "O agente atendeu e está
+# desligando a VM" tem de ter tempo: o desligamento envolve um controlvm e até
+# 20 sondagens do estado, e um prazo único de 5s expirava no meio disso — o
+# backup então registrava "fencing NÃO confirmado" e assumia o IP assim mesmo,
+# degradando em silêncio para o caminho inseguro.
+TIMEOUT_CONEXAO = 3.0
+TIMEOUT_RESPOSTA = 25.0
 
 
 class Promotor:
@@ -26,8 +33,8 @@ class Promotor:
 
     def _pedir_ao_agente(self, acao: str) -> tuple[bool, str]:
         try:
-            with socket.create_connection(self.agente, timeout=TIMEOUT_AGENTE) as s:
-                s.settimeout(TIMEOUT_AGENTE)
+            with socket.create_connection(self.agente, timeout=TIMEOUT_CONEXAO) as s:
+                s.settimeout(TIMEOUT_RESPOSTA)
                 s.sendall((json.dumps({"acao": acao, "vm": self.vm_alvo}) + "\n").encode())
                 bruto = b""
                 while b"\n" not in bruto and len(bruto) < 4096:
