@@ -3,18 +3,25 @@
 Trabalho de Sistemas Distribuídos. Dois jogadores disputam a mesma palavra, e o
 serviço continua funcionando quando a máquina que o atende morre.
 
-Python 3, **só biblioteca padrão**. Nada a instalar.
+Python 3. O servidor usa **só biblioteca padrão**; o cliente gráfico usa **PyQt6**:
+
+```powershell
+py -m pip install PyQt6
+```
+
+Use `py`, não `python` — em máquinas onde o Python veio da Microsoft Store, o
+comando `python` é apenas um atalho que não executa nada.
 
 ## Requisitos
 
 | Requisito | Onde está |
 |---|---|
-| Socket para comunicação | `protocolo.py`, `servidor.py`, `cliente.py` |
+| Socket para comunicação | `protocolo.py`, `servidor.py`, `cliente_gui.py` |
 | Servidor resiliente (se cair, outro assume) | `replicacao.py`, `promocao.py`, `infra/agente_fencing.py` |
 | Sala de espera, múltiplas requisições | `sala.py` |
 | Máximo 2 jogadores por partida | `sala.py` |
 | Servidor como semáforo, um por vez | `servidor.py` — event loop de thread única |
-| Bonequinho de cada jogador visível para ambos | `cliente.py`, mensagem `estado` |
+| Bonequinho de cada jogador visível para ambos | `cliente_gui.py`, mensagem `estado` |
 
 ## Arquivos
 
@@ -24,7 +31,8 @@ Python 3, **só biblioteca padrão**. Nada a instalar.
 | `jogo.py` | Regras da forca, sem rede |
 | `sala.py` | Sala de espera, convites, fila, tokens |
 | `servidor.py` | Event loop, protocolo, replicação, promoção |
-| `cliente.py` | Terminal e reconexão automática |
+| **`cliente_gui.py`** | **Cliente gráfico em PyQt6 — é esta a entrega** |
+| `cliente.py` | Cliente de terminal — **ferramenta de teste**, não é entregável |
 | `replicacao.py` | Canal do primário para o backup |
 | `promocao.py` | Fencing e takeover, no backup |
 | `sonda.py` | Mede indisponibilidade no failover |
@@ -45,9 +53,9 @@ Rede host-only, não bridge: funciona em qualquer rede, sem interferência de VP
 ### Local (sem failover)
 
 ```powershell
-python servidor.py --nome LOCAL
-python cliente.py Pedro
-python cliente.py Ana
+py servidor.py --nome LOCAL
+py cliente_gui.py Pedro
+py cliente_gui.py Ana
 ```
 
 ### Completo (com duas VMs)
@@ -60,7 +68,7 @@ Requer VirtualBox, VMs `VM1` e `VM2` em host-only, **1 núcleo cada**, chave em
 desligamento, e o split-brain deixa de ser teórico:
 
 ```powershell
-python infra\agente_fencing.py --host 192.168.56.1 --porta 5010
+py infra\agente_fencing.py --host 192.168.56.1 --porta 5010
 ```
 
 **2. Backup (VM2)** — entre na VM primeiro, pelo PowerShell:
@@ -94,37 +102,45 @@ cd ~/JogoDaForca && python3 servidor.py --nome VM1 --porta 5000 --par 192.168.56
 **4. Clientes, no host:**
 
 ```powershell
-python cliente.py Pedro --host 192.168.56.10
-python cliente.py Ana   --host 192.168.56.10
+py cliente_gui.py Pedro --host 192.168.56.10
+py cliente_gui.py Ana   --host 192.168.56.10
 ```
 
-### Comandos do cliente
+### Como jogar
 
-`/c <id>` convidar · `/s` aceitar · `/n` recusar · `/?` ajuda · uma letra chuta
+Selecione um jogador e clique **Convidar** (ou duplo clique na linha). **Enter** aceita um convite, **Esc** recusa. Durante a partida, clique a letra ou digite no teclado.
 
 ## Roteiro de demonstração
 
 O cabeçalho do cliente mostra **qual servidor atende** — é o que torna o failover
 visível.
 
-**1. Jogo e semáforo.** Convide com `/c`, aceite com `/s`. Mostrar: os dois
-bonequinhos aparecem para ambos; o turno alterna a cada chute; fora da vez é
-recusado; letra repetida é recusada sem passar o turno. Com `MAÇÃ`, chutar `A`
-revela o `Ã`.
+**1. Jogo e semáforo.** Duplo clique no adversário para convidar, **Enter** para
+aceitar. Mostrar: os dois bonequinhos aparecem para ambos; o turno alterna a cada
+chute; as letras ficam **verdes quando acertam e vermelhas quando erram**; fora da
+vez o teclado inteiro fica desabilitado. Com `MAÇÃ`, chutar `A` revela o `Ã`.
+No fim aparece a tela de **vitória/derrota com a palavra revelada**, que volta
+sozinha para a sala em 12 s (ou no **Enter**).
 
 **2. Sala de espera.** Quatro clientes, duas duplas. A segunda fica `na_fila` e vê a
 posição; quando a primeira partida acaba, ela assume o slot sozinha. Mostrar também
-convite recusado com `/n`, convite expirando em 30 s, e dois clientes com o mesmo
-nome (o segundo entra como `Joao742`).
+convite recusado com **Esc**, convite expirando em 30 s, e dois clientes com o
+mesmo nome (o segundo entra como `Joao742`).
 
-**3. Reconexão, sem failover.** Feche um cliente com Ctrl+C e reabra com o mesmo
-nome. O adversário vê `[PARTIDA SUSPENSA] ... anula em 28s`, com o contador andando;
-o cliente reaberto retoma painel, erros, turno e chutadas exatamente como estavam.
+**2b. Prazo da jogada.** Suba o servidor com `py servidor.py --nome LOCAL
+--prazo-jogada 20` — 3 min não cabem numa apresentação. O contador aparece sob
+`SUA VEZ` e fica **vermelho** nos últimos segundos; ao zerar, quem estava na vez
+perde e o outro vence, com o placar mostrando que **nenhum erro foi somado**.
+Mostrar também que o contador **congela** enquanto a partida está suspensa.
+
+**3. Reconexão, sem failover.** Feche a janela de um cliente e reabra com o mesmo
+nome. O adversário vê **PARTIDA SUSPENSA** com o contador regressivo andando; o
+cliente reaberto retoma painel, erros, turno e chutadas exatamente como estavam.
 Em outra tentativa, deixe o prazo vencer: a partida é anulada.
 
 **4. Replicação.** Com jogadores na partida pelo IP virtual, abra um cliente direto
-na VM2 (`--host 192.168.56.12`): ela lista os jogadores sem nunca ter falado com
-eles.
+na VM2 (`py cliente_gui.py Espiao --host 192.168.56.12`): ela lista os jogadores
+sem nunca ter falado com eles.
 
 **5. Failover automático.** Com partida em andamento, mate a VM1:
 
@@ -132,13 +148,13 @@ eles.
 & "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe" controlvm VM1 poweroff
 ```
 
-Na tela do cliente: `servidor mudo há 6s` → `reconectando` → `retomando sessão` →
-`>>> servidor mudou: VM1 -> VM2 <<<`, e a partida continua. No log da VM2:
+Na tela do cliente aparece uma **faixa laranja de aviso**, o topo troca de
+`servidor: VM1` para `servidor: VM2` **piscando**, e a partida continua. No log da VM2:
 `3 batidas perdidas` → `fencing confirmado` → `IP virtual assumido` →
-`PROMOÇÃO concluída`. Cerca de **12 s** fora do ar; `python sonda.py --host
+`PROMOÇÃO concluída`. Cerca de **12 s** fora do ar; `py sonda.py --host
 192.168.56.10` mede.
 
-**5b. A janela impossível de acertar na mão.** `python infra\armar_falha.py --host
+**5b. A janela impossível de acertar na mão.** `py infra\armar_falha.py --host
 192.168.56.10` faz o servidor morrer **entre** replicar e confirmar — janela de
 fração de milissegundo. O cliente não recebe confirmação, reenvia o lance após o
 failover, e ele conta **uma única vez**.
@@ -156,6 +172,12 @@ failover, e ele conta **uma única vez**.
 - **Fencing por terceira autoridade.** Com dois nós não existe quórum, e o silêncio
   não diz se o outro morreu ou se a rede partiu. Quem consegue desligar o par pelo
   hypervisor vence.
+- **Prazo de 3 min por jogada.** O semáforo garante que só um joga por vez, mas
+  não garante que a vez acabe: um jogador conectado e parado congelava a partida
+  para sempre, e com ela o slot da próxima dupla. O prazo é o que fecha isso. Ele
+  fica com o servidor, não com o cliente — relógio de cliente é relógio que o
+  jogador controla. E o estouro **não conta como erro**: o boneco para onde
+  parou, para quem lê a tela no fim entender que foi o relógio, não a forca.
 - **Event loop de thread única.** Elimina por construção a corrida de
   *check-then-act* na sala, e cumpre "um jogador por vez" literalmente.
 
@@ -168,5 +190,6 @@ failover, e ele conta **uma única vez**.
 | Timeout de replicação | 300 ms — muito menor que os 6 s de detecção |
 | Prazo de reconexão | 30 s — maior que os 6 s de detecção |
 | Prazo de convite | 30 s |
+| Prazo da jogada | 180 s (3 min) — estourou, perde a partida |
 | Erros até a forca completa | 6 |
 | Retentativa de replicação | 5 s |

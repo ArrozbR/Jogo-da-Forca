@@ -69,6 +69,20 @@ class Partida:
 
         return True, "acertou" if acertou else "errou"
 
+    def perder_por_tempo(self, slot: str) -> bool:
+        """Estourou o prazo da jogada: quem estava na vez perde, o outro vence.
+
+        Não mexe em `erros` nem em `chutadas` de propósito. Estouro não é chute
+        errado: o placar continua contando só o que foi de fato jogado, e o
+        boneco do jogador para onde parou. Quem lê a tela no fim vê a partida
+        decidida com 2/6 erros e entende que foi o relógio, não a forca.
+        """
+        if self.encerrada or slot != self.turno:
+            return False
+        self.vencedor = self._adversario(slot)
+        self.encerrada = True
+        return True
+
     def _adversario(self, slot: str) -> str:
         return self.slots[1] if slot == self.slots[0] else self.slots[0]
 

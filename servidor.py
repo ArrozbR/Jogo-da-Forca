@@ -15,6 +15,7 @@ from sala import PRAZO_RECONEXAO, SUSPENSO, Sala
 
 INTERVALO_HEARTBEAT = 2.0
 ESPERA_SELECT = 0.5
+PRAZO_JOGADA = 180.0        # 3 min para chutar, senão perde a partida
 JANELA_DETECCAO_PAR = 6.0   # 3 batidas perdidas, igual à do cliente
 
 
@@ -40,7 +41,8 @@ class Servidor:
                  prazo_reconexao: float = PRAZO_RECONEXAO,
                  par: tuple[str, int] | None = None,
                  porta_replicacao: int | None = None,
-                 ip_par: str | None = None):
+                 ip_par: str | None = None,
+                 prazo_jogada: float = PRAZO_JOGADA):
         self.nome = nome
         self.host = host
         self.porta = porta
@@ -53,13 +55,26 @@ class Servidor:
         self.dupla: tuple[int, int] | None = None
         self.proximo_heartbeat = 0.0
 
+        # Relógio da jogada guardado como QUANTO FALTA, não como instante de
+        # vencimento. time.monotonic() conta a partir de uma origem própria de
+        # cada processo, então um instante replicado não significa nada na outra
+        # máquina — já a duração significa. É a mesma regra do prazo de
+        # reconexão, e é o que faz o failover não roubar o tempo de quem joga.
+        self.prazo_jogada = prazo_jogada
+        self.falta_jogada: float | None = None
+        self.ultimo_tique = time.monotonic()
+
         # Último lance aceito de cada jogador, para reconhecer reenvio. Faz parte
         # do estado replicado: é o que impede o backup de contar o mesmo chute
         # duas vezes quando o cliente reenvia por não ter recebido a confirmação.
         self.ultimo_lance: dict[int, int] = {}
 
         self.porta_replicacao = porta_replicacao
-        self.ip_par = ip_par
+        # Conjunto, não um endereço só: o primário tem o IP fixo dele E o IP
+        # virtual na mesma interface, e qual deles o kernel usa como origem da
+        # conexão de replicação varia por máquina. Os dois são legítimos — o IP
+        # virtual, por definição, está com quem é primário.
+        self.ips_permitidos = {ip_par} if ip_par else set()
         self.replicador = (
             Replicador(par[0], par[1], log=lambda m: self._log(f"[repl] {m}"))
             if par else None
@@ -104,6 +119,7 @@ class Servidor:
             # O select acorda por timeout mesmo sem tráfego: é o que mantém o
             # heartbeat saindo e os prazos de convite sendo cobrados.
             self._cobrar_prazos()
+            self._cobrar_jogada()
             if time.monotonic() >= self.proximo_heartbeat:
                 self._transmitir({"tipo": "heartbeat"})
                 # Com a partida suspensa o adversário vê um contador regressivo, e
@@ -293,15 +309,22 @@ class Servidor:
         if lance is not None:
             self.ultimo_lance[ident] = lance
         self._log(f"jogador {ident} chutou {letra.upper()}: {motivo}")
+        self.falta_jogada = self.prazo_jogada
         self._publicar_partida()
 
         if self.partida.encerrada:
-            self._log(f"partida encerrada, vencedor {self.partida.vencedor}")
-            self.sala.encerrar_partida(self.dupla)
-            self.partida = None
-            self.dupla = None
-            self._tentar_iniciar()
-            self._publicar()
+            self._dissolver_partida()
+
+    def _dissolver_partida(self):
+        """Devolve a dupla para a sala e chama a próxima. Vale para os dois
+        jeitos de acabar: pela palavra/erros e pelo estouro do prazo."""
+        self._log(f"partida encerrada, vencedor {self.partida.vencedor}")
+        self.sala.encerrar_partida(self.dupla)
+        self.partida = None
+        self.dupla = None
+        self.falta_jogada = None
+        self._tentar_iniciar()
+        self._publicar()
 
     def _tentar_iniciar(self):
         if self.partida is not None:
@@ -312,6 +335,7 @@ class Servidor:
         palavra = random.choice(self.palavras)
         self.partida = Partida(palavra, list(dupla))
         self.dupla = dupla
+        self.falta_jogada = self.prazo_jogada
         nomes = " x ".join(self.sala.jogadores[i].nome for i in dupla)
         self._log(f"partida iniciada: {nomes}, palavra {palavra}")
 
@@ -331,6 +355,49 @@ class Servidor:
              if i in self.sala.jogadores and self.sala.jogadores[i].estado == SUSPENSO),
             None,
         )
+
+    def _sou_quem_atende(self) -> bool:
+        """Primário, ou backup já promovido. O backup em espera não cobra prazo
+        nenhum: quem manda no jogo é quem está com os clientes."""
+        return self.promotor is None or self.promotor.promovido
+
+    def _cobrar_jogada(self):
+        """Desconta o relógio da vez e encerra a partida se ele zerar.
+
+        Pausa com a partida suspensa: o adversário do jogador que caiu não pode
+        perder no tempo esperando alguém que o servidor sabe que não está lá.
+
+        O backup em espera não desconta nada — ele recebe o que falta junto com
+        o instantâneo. Se for promovido no meio de uma vez, o jogador recomeça
+        com o tempo do último instantâneo, em vez de perder por um relógio que
+        correu enquanto ninguém conseguia falar com o servidor.
+        """
+        agora = time.monotonic()
+        decorrido = agora - self.ultimo_tique
+        self.ultimo_tique = agora
+
+        if not self._sou_quem_atende() or self.partida is None:
+            return
+        if self.falta_jogada is None or self._suspensa():
+            return
+
+        self.falta_jogada -= decorrido
+        if self.falta_jogada > 0:
+            return
+
+        # Desarma o relógio antes de agir. Se a partida já estivesse encerrada
+        # por outro caminho, sair daqui com o relógio zerado faria esta volta se
+        # repetir a cada passagem do laço, com o valor afundando no negativo.
+        self.falta_jogada = None
+        lento = self.partida.turno
+        if not self.partida.perder_por_tempo(lento):
+            return
+        nome = self.sala.jogadores[lento].nome if lento in self.sala.jogadores else "?"
+        self._log(f"prazo da jogada de {nome} venceu: perdeu por tempo")
+        for ident in self.dupla:
+            self._avisar(ident, f"{nome} não jogou em {int(self.prazo_jogada)}s")
+        self._publicar_partida()
+        self._dissolver_partida()
 
     def _cobrar_prazos(self):
         mudou = False
@@ -388,6 +455,8 @@ class Servidor:
             "chutadas": sorted(self.partida.chutadas),
             "encerrada": self.partida.encerrada,
             "vencedor": self.partida.vencedor,
+            "prazo_jogada": self.prazo_jogada,
+            "falta_jogada": None if self._suspensa() else self.falta_jogada,
             "palavra": self.partida.palavra if self.partida.encerrada else None,
         }
 
@@ -420,6 +489,7 @@ class Servidor:
             "partida": self.partida.para_dict() if self.partida else None,
             "dupla": list(self.dupla) if self.dupla else None,
             "ultimo_lance": {str(k): v for k, v in self.ultimo_lance.items()},
+            "falta_jogada": self.falta_jogada,
         }
 
     def _aplicar_instantaneo(self, d: dict):
@@ -435,11 +505,13 @@ class Servidor:
         nova_partida = Partida.de_dict(d["partida"]) if d.get("partida") else None
         nova_dupla = tuple(d["dupla"]) if d.get("dupla") else None
         novo_lance = {int(k): v for k, v in (d.get("ultimo_lance") or {}).items()}
+        nova_falta = d.get("falta_jogada")
 
         self.sala = nova_sala
         self.partida = nova_partida
         self.dupla = nova_dupla
         self.ultimo_lance = novo_lance
+        self.falta_jogada = nova_falta
 
     def _replicar(self):
         """Empurra o estado para o backup ANTES de confirmar ao cliente.
@@ -508,9 +580,9 @@ class Servidor:
         # descartado, e ao morrer essa conexão o backup concluía que o primário
         # havia caído — e DESLIGAVA a máquina saudável pelo fencing. Lixo numa
         # linha derrubava fisicamente o servidor bom.
-        if self.ip_par and endereco[0] != self.ip_par:
+        if self.ips_permitidos and endereco[0] not in self.ips_permitidos:
             self._log(f"[repl] conexão de {endereco[0]} recusada "
-                      f"(só {self.ip_par} pode replicar)")
+                      f"(aceito apenas de {', '.join(sorted(self.ips_permitidos))})")
             sock.close()
             return
 
@@ -653,7 +725,10 @@ class Servidor:
 
 
 def carregar_palavras(caminho: Path) -> list[str]:
-    linhas = caminho.read_text(encoding="utf-8").splitlines()
+    # utf-8-sig, e não utf-8: o Bloco de Notas e o PowerShell gravam UTF-8 com
+    # BOM, e o marcador entraria como se fosse a primeira letra da primeira
+    # palavra — a partida começaria com um caractere invisível no painel.
+    linhas = caminho.read_text(encoding="utf-8-sig").splitlines()
     return [linha.strip() for linha in linhas if linha.strip()]
 
 
@@ -665,6 +740,8 @@ def main():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--porta", type=int, default=5000)
     parser.add_argument("--palavras", type=Path, default=Path(__file__).parent / "palavras.txt")
+    parser.add_argument("--prazo-jogada", type=float, default=PRAZO_JOGADA,
+                        help="segundos para chutar antes de perder a partida")
     parser.add_argument("--prazo-reconexao", type=float, default=PRAZO_RECONEXAO,
                         help="segundos para um jogador caído voltar antes de anular")
     parser.add_argument("--par", metavar="HOST:PORTA",
@@ -691,7 +768,12 @@ def main():
 
     servidor = Servidor(args.nome, args.host, args.porta,
                         carregar_palavras(args.palavras), args.prazo_reconexao,
-                        par, args.porta_replicacao, args.ip_par)
+                        par, args.porta_replicacao, args.ip_par, args.prazo_jogada)
+
+    # O IP virtual acompanha quem é primário, então ele também é origem legítima
+    # de replicação — e o backup já o conhece, sem precisar de outro parâmetro.
+    if args.ip_par and args.ip_virtual:
+        servidor.ips_permitidos.add(args.ip_virtual.split("/")[0])
 
     if args.agente_fencing:
         host, _, porta = args.agente_fencing.rpartition(":")

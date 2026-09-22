@@ -1,3 +1,9 @@
+"""Cliente de terminal — FERRAMENTA DE TESTE, não é a entrega.
+
+A entrega é o `cliente_gui.py`, em PyQt6. Este cliente continua no projeto por
+ser roteirizável: dá para dirigi-lo por script e verificar o protocolo, a
+reconexão e o failover de forma automatizada, o que não se faz com uma janela.
+"""
 import argparse
 import os
 import queue

@@ -4,7 +4,7 @@ param(
     [string]$Usuario = "aluno",
     [string]$Senha = "forca2026",
     [string]$Chave = "$env:USERPROFILE\.ssh\forca_vm",
-    [string]$Projeto = "G:\Facul\Projetos\SistemasDistribuidos\JogoDaForca"
+    [string]$Projeto = (Split-Path -Parent $PSScriptRoot)
 )
 
 $ErrorActionPreference = "Continue"
@@ -28,7 +28,14 @@ foreach ($nome in $vms.Keys | Sort-Object) {
     Write-Host ($r -join "`n")
 
     Write-Host "-- copiando o projeto"
-    & scp @opcoes -r -q "$Projeto" "$Usuario@${ip}:~/" 2>&1 | ForEach-Object { Write-Host $_ }
+    # Só o que a VM precisa para rodar. Copiar a pasta inteira arrastaria o .git,
+    # cujos objetos sao gravados somente-leitura: recopiar por cima falha com
+    # "permission denied" e enche a tela de erro sem nada de errado acontecer.
+    Remoto $ip "mkdir -p ~/JogoDaForca/infra" | Out-Null
+    & scp @opcoes -q "$Projeto\*.py" "$Projeto\palavras.txt" "$Usuario@${ip}:~/JogoDaForca/" 2>&1 |
+        ForEach-Object { Write-Host $_ }
+    & scp @opcoes -q "$Projeto\infra\*.sh" "$Projeto\infra\*.py" "$Usuario@${ip}:~/JogoDaForca/infra/" 2>&1 |
+        ForEach-Object { Write-Host $_ }
 
     $conf = Remoto $ip "ls ~/JogoDaForca/*.py | wc -l; which arping || echo 'arping AUSENTE'"
     Write-Host ("arquivos .py e arping: " + ($conf -join " | "))
