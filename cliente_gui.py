@@ -15,10 +15,14 @@ A rede usa socket comum lido por um QTimer, e não QTcpSocket: a lógica de
 reconexão e enquadramento já estava testada, e reescrevê-la só para ficar
 idiomática em Qt seria trocar algo que funciona por algo por testar.
 
-    py cliente_gui.py Pedro --host 192.168.56.10
+O failover é pela lista de servidores: o cliente conhece os dois e, quando o
+atual cai ou responde que é backup, tenta o próximo.
+
+    py cliente_gui.py Pedro --host 192.168.43.20,192.168.43.31
 """
 import argparse
 import os
+import select
 import socket
 import sys
 import tempfile
@@ -38,7 +42,25 @@ from protocolo import BufferExcedido, Enquadrador, empacotar
 INTERVALO_TICK = 50
 JANELA_DETECCAO = 6.0
 ESPERA_RECONEXAO = 1.0
+# Numa rede Wi-Fi, conectar num notebook desligado não recebe recusa: o pedido
+# some e só o prazo encerra a tentativa. Curto para o failover não esperar à toa.
+TIMEOUT_CONEXAO = 2.0
 MAX_ERROS = 6
+
+
+def interpretar_servidores(texto: str, porta_padrao: int) -> list[tuple[str, int]]:
+    """'10.0.0.5,10.0.0.7:5100' -> [('10.0.0.5', 5000), ('10.0.0.7', 5100)]."""
+    enderecos = []
+    for parte in texto.split(","):
+        parte = parte.strip()
+        if not parte:
+            continue
+        host, separador, porta = parte.rpartition(":")
+        if separador and porta.isdigit():
+            enderecos.append((host, int(porta)))
+        else:
+            enderecos.append((parte, porta_padrao))
+    return enderecos or [("127.0.0.1", porta_padrao)]
 
 FUNDO = "#15161c"
 PAINEL = "#1e2029"
@@ -129,13 +151,18 @@ class Forca(QWidget):
 class JanelaForca(QMainWindow):
     def __init__(self, nome: str, host: str, porta: int, sessao_nova: bool = False):
         super().__init__()
-        self.nome, self.host, self.porta = nome, host, porta
+        self.nome = nome
+        # `host` pode ser um endereço ou vários separados por vírgula.
+        self.enderecos = interpretar_servidores(host, porta)
+        self.indice = 0
 
         self.sock: socket.socket | None = None
         self.enquadrador = Enquadrador()
         self.ultimo_contato = 0.0
         self.proxima_tentativa = 0.0
         self.conectado = False
+        self.conectando = False
+        self.conectando_desde = 0.0
 
         self.meu_id = None
         self.servidor_atual = None
@@ -158,7 +185,12 @@ class JanelaForca(QMainWindow):
         # fora da pasta temporária, ou o open falharia calado e a sessão nunca
         # seria salva.
         seguro = "".join(c for c in nome if c.isalnum() or c in "-_") or "jogador"
-        base = f"forca-{seguro}-{host}-{porta}"
+        # A sessão é do serviço, não de uma máquina: o mesmo token tem de valer
+        # no primário e no backup, senão o failover faria o jogador entrar como
+        # novo. Por isso a chave junta todos os endereços, em ordem fixa.
+        chave = "_".join(f"{h}-{p}" for h, p in sorted(self.enderecos))
+        chave = "".join(c for c in chave if c.isalnum() or c in "-_.")
+        base = f"forca-{seguro}-{chave}"
         self.arquivo_token = pasta / f"{base}.token"
         self.arquivo_trava = pasta / f"{base}.lock"
         self._trava = None
@@ -522,15 +554,47 @@ class JanelaForca(QMainWindow):
 
     # ------------------------------------------------------------ rede
     def _conectar(self):
-        try:
-            self.sock = socket.create_connection((self.host, self.porta), timeout=5)
-            self.sock.setblocking(False)
-        except OSError as erro:
-            self.sock = None
-            self.proxima_tentativa = time.monotonic() + ESPERA_RECONEXAO
-            self._status(f"sem conexão ({erro.strerror or erro})", RUIM)
-            return
+        """Inicia a conexão SEM esperar por ela.
 
+        create_connection bloqueia até conectar ou estourar o prazo, e aqui ele
+        roda na thread do Qt: com o outro notebook desligado a janela congelava
+        segundos a cada tentativa, justamente durante o failover, que é o
+        momento que a demonstração existe para mostrar. Agora o pedido sai e o
+        _tick acompanha a resposta a cada 50 ms, com a tela viva.
+        """
+        host, porta = self.enderecos[self.indice]
+        self._status(f"conectando a {host}:{porta}...", ALERTA)
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setblocking(False)
+            sock.connect_ex((host, porta))
+        except OSError as erro:
+            if sock is not None:
+                sock.close()
+            self._falhou(f"{host}:{porta} ({erro.strerror or erro})")
+            return
+        self.sock = sock
+        self.conectando = True
+        self.conectando_desde = time.monotonic()
+
+    def _acompanhar_conexao(self, agora: float):
+        host, porta = self.enderecos[self.indice]
+        # No Windows a conexão recusada aparece na lista de exceção do select,
+        # não na de escrita. Por isso o socket vai nas duas.
+        _, pronto, falho = select.select([], [self.sock], [self.sock], 0)
+        if pronto or falho:
+            codigo = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if pronto and codigo == 0:
+                self.conectando = False
+                self._conectou()
+            else:
+                motivo = "recusada" if codigo in (111, 10061) else f"erro {codigo}"
+                self._falhou(f"{host}:{porta} {motivo}")
+        elif agora - self.conectando_desde > TIMEOUT_CONEXAO:
+            self._falhou(f"{host}:{porta} não respondeu")
+
+    def _conectou(self):
         # Buffer novo por conexão: sobra da conexão morta viraria JSON inválido.
         self.enquadrador = Enquadrador()
         self.ultimo_contato = time.monotonic()
@@ -543,8 +607,26 @@ class JanelaForca(QMainWindow):
             self._status("conectado", BOM)
             self._mandar({"tipo": "entrar", "nome": self.nome})
 
+    def _proximo_servidor(self):
+        # Sempre avança, até quando só um endereço falhou por acaso: se o outro
+        # for o backup em espera, ele recusa e a volta seguinte cai aqui de novo.
+        self.indice = (self.indice + 1) % len(self.enderecos)
+
+    def _falhou(self, motivo: str):
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+        self.conectando = False
+        self.conectado = False
+        self._proximo_servidor()
+        self.proxima_tentativa = time.monotonic() + ESPERA_RECONEXAO
+        self._status(f"sem conexão: {motivo}", RUIM)
+
     def _mandar(self, mensagem: dict):
-        if not self.sock:
+        if not self.sock or not self.conectado:
             return
         try:
             self.sock.sendall(empacotar(mensagem))
@@ -559,23 +641,34 @@ class JanelaForca(QMainWindow):
                 pass
         self.sock = None
         self.conectado = False
+        self.conectando = False
+        self._proximo_servidor()
         self.proxima_tentativa = time.monotonic() + ESPERA_RECONEXAO
         self._status(f"reconectando ({motivo})", ALERTA)
 
     def _tick(self):
         agora = time.monotonic()
+        if self.conectando:
+            self._acompanhar_conexao(agora)
+            return
         if not self.conectado:
             if agora >= self.proxima_tentativa:
                 self._conectar()
             return
 
+        # `self.conectado` é conferido a cada passo porque _tratar pode derrubar
+        # a conexão no meio — a recusa do backup faz isso, e um _mandar que
+        # falha também. Sem a conferência, a volta seguinte chamava recv em
+        # None, e AttributeError dentro de um slot do Qt é abort do processo.
         try:
-            while True:
+            while self.conectado:
                 dados = self.sock.recv(65536)
                 if not dados:
                     self._cair("servidor fechou")
                     return
                 for m in self.enquadrador.alimentar(dados):
+                    if not self.conectado:
+                        return
                     try:
                         self._tratar(m)
                     except Exception as erro:
@@ -590,9 +683,12 @@ class JanelaForca(QMainWindow):
         except BlockingIOError:
             pass
         except (OSError, ValueError, BufferExcedido) as erro:
-            self._cair(type(erro).__name__)
+            if self.conectado:
+                self._cair(type(erro).__name__)
             return
 
+        if not self.conectado:
+            return
         if agora - self.ultimo_contato > JANELA_DETECCAO:
             # Silêncio sem erro de socket: é assim que uma máquina que evapora
             # se manifesta — ninguém avisa nada.
@@ -602,6 +698,13 @@ class JanelaForca(QMainWindow):
     def _tratar(self, m: dict):
         self.ultimo_contato = time.monotonic()
         tipo = m.get("tipo")
+
+        # Tratado antes do nome do servidor, de propósito: a recusa vem assinada
+        # pelo backup, e trocar o topo para "servidor: VM2" piscando anunciaria
+        # um failover que não aconteceu.
+        if tipo == "nao_sou_primario":
+            self._cair(f"{m.get('servidor') or 'este servidor'} é o backup")
+            return
 
         servidor = m.get("servidor")
         if servidor and servidor != self.servidor_atual:
@@ -851,7 +954,9 @@ class JanelaForca(QMainWindow):
 def main():
     parser = argparse.ArgumentParser(description="Cliente gráfico do jogo da forca")
     parser.add_argument("nome")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="um endereço, ou vários separados por vírgula "
+                             "(host ou host:porta) — o failover percorre a lista")
     parser.add_argument("--porta", type=int, default=5000)
     parser.add_argument("--sessao-nova", action="store_true",
                         help="ignora o token salvo e entra como jogador novo")

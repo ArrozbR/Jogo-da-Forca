@@ -1,6 +1,11 @@
-# Prepara as duas VMs ja instaladas: instala o arping, copia o projeto e
-# confere a versao do Python. Idempotente - pode rodar de novo sem estragar.
+# Prepara as VMs ja instaladas: instala o arping, copia o projeto e confere a
+# versao do Python. Idempotente - pode rodar de novo sem estragar.
+#
+# Com uma VM por notebook, cada um provisiona so a sua:
+#   infra\provisionar.ps1 -Vms VM1      (no notebook A)
+#   infra\provisionar.ps1 -Vms VM2      (no notebook B)
 param(
+    [string[]]$Vms = @("VM1", "VM2"),
     [string]$Usuario = "aluno",
     [string]$Senha = "forca2026",
     [string]$Chave = "$env:USERPROFILE\.ssh\forca_vm",
@@ -8,7 +13,9 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
-$vms = @{ "VM1" = "192.168.56.11"; "VM2" = "192.168.56.12" }
+$enderecos = @{ "VM1" = "192.168.56.11"; "VM2" = "192.168.56.12" }
+$vms = @{}
+foreach ($v in $Vms) { $vms[$v] = $enderecos[$v] }
 $opcoes = @("-i", $Chave, "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10")
 
 function Remoto([string]$ip, [string]$comando) {

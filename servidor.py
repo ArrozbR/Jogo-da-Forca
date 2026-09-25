@@ -1,4 +1,5 @@
 import argparse
+import hmac
 import os
 import random
 import selectors
@@ -11,12 +12,16 @@ from jogo import MAX_ERROS, Partida
 from protocolo import BufferExcedido, Enquadrador, empacotar
 from promocao import Promotor
 from replicacao import Replicador
-from sala import PRAZO_RECONEXAO, SUSPENSO, Sala
+from sala import JOGANDO, PRAZO_RECONEXAO, SUSPENSO, Sala
 
 INTERVALO_HEARTBEAT = 2.0
 ESPERA_SELECT = 0.5
 PRAZO_JOGADA = 180.0        # 3 min para chutar, senão perde a partida
 JANELA_DETECCAO_PAR = 6.0   # 3 batidas perdidas, igual à do cliente
+
+# O que um backup em espera recusa. Ping fica de fora: responder que está vivo
+# não é atender jogador.
+MENSAGENS_DE_JOGO = {"entrar", "reconectar", "convidar", "aceitar", "recusar", "chute"}
 
 
 def limpar_nome(bruto) -> str:
@@ -46,10 +51,14 @@ class Conexao:
 class ConexaoReplica:
     """No backup: a conexão que o primário usa para empurrar estado."""
 
-    def __init__(self, sock, endereco):
+    def __init__(self, sock, endereco, autenticada: bool = True):
         self.sock = sock
         self.endereco = endereco
         self.enquadrador = Enquadrador()
+        # Com segredo configurado, nasce sem identidade: só vira o canal do
+        # primário depois de dizer o segredo na primeira mensagem.
+        self.autenticada = autenticada
+        self.desde = time.monotonic()
 
 
 class Servidor:
@@ -58,7 +67,8 @@ class Servidor:
                  par: tuple[str, int] | None = None,
                  porta_replicacao: int | None = None,
                  ip_par: str | None = None,
-                 prazo_jogada: float = PRAZO_JOGADA):
+                 prazo_jogada: float = PRAZO_JOGADA,
+                 segredo: str | None = None):
         self.nome = nome
         self.host = host
         self.porta = porta
@@ -91,8 +101,18 @@ class Servidor:
         # conexão de replicação varia por máquina. Os dois são legítimos — o IP
         # virtual, por definição, está com quem é primário.
         self.ips_permitidos = {ip_par} if ip_par else set()
+
+        # Segredo compartilhado entre primário e backup. Existe porque, com as
+        # VMs atrás de NAT, toda conexão chega à VM vinda do gateway do
+        # VirtualBox: o IP de origem deixa de dizer quem é quem, e o --ip-par
+        # não protege mais nada. Sem isto voltaria a brecha da auditoria — um
+        # impostor fazendo o backup desligar o primário saudável.
+        self.segredo = segredo
+        self.pendentes: dict[socket.socket, ConexaoReplica] = {}
+
         self.replicador = (
-            Replicador(par[0], par[1], log=lambda m: self._log(f"[repl] {m}"))
+            Replicador(par[0], par[1], log=lambda m: self._log(f"[repl] {m}"),
+                       segredo=segredo)
             if par else None
         )
         self.replica: ConexaoReplica | None = None
@@ -177,8 +197,20 @@ class Servidor:
     def _tratar(self, conexao: Conexao, mensagem: dict):
         tipo = mensagem.get("tipo")
 
+        # isinstance antes do `in`: testar se um valor está num conjunto exige
+        # que ele seja hasheável, e `{"tipo": [[...]]}` fazia o `in` levantar
+        # TypeError e derrubar o servidor. As comparações com == que vêm abaixo
+        # aceitam qualquer tipo; foi o conjunto que abriu o buraco.
+        if (isinstance(tipo, str) and tipo in MENSAGENS_DE_JOGO
+                and not self._sou_quem_atende()):
+            self._recusar_jogador(conexao)
+            return
+
         if tipo == "ping":
-            self._enviar(conexao, {"tipo": "pong"})
+            # Ping continua respondido pelo backup: é sinal de vida da máquina, e
+            # a sonda precisa dele. Mas diz se atende, senão a sonda confundiria
+            # "backup no ar" com "serviço no ar".
+            self._enviar(conexao, {"tipo": "pong", "atendendo": self._sou_quem_atende()})
         elif tipo == "crash_apos_replicar":
             self.morrer_apos_replicar = True
             self._log("INJEÇÃO DE FALHA armada: morro no próximo lance, "
@@ -380,29 +412,78 @@ class Servidor:
         )
 
     def _sou_quem_atende(self) -> bool:
-        """Cobra prazo quem é dono do estado, e não quem tem uma cópia.
+        """Atende jogador e cobra prazo quem é dono do estado, não quem tem cópia.
 
-        Dono é quem não está sendo alimentado por ninguém AGORA. Enquanto um
-        primário empurra estado para cá, o relógio que vale é o dele: cobrar
-        aqui também encerraria partidas na cópia enquanto o primário segue
-        jogando, e a próxima mensagem dele desfaria isso — divergência visível.
+        Desde que o failover passou a ser pela lista de servidores do cliente, a
+        mesma pergunta decide também quem pode receber jogador. Um backup que
+        atendesse com o primário vivo faria o cliente jogar numa cópia que a
+        próxima mensagem do primário apaga.
 
-        Duas respostas erradas que eu já dei aqui, as duas por perguntar a
-        coisa errada:
+        - Sem porta de replicação: é o primário. Atende.
+        - Backup COM agente de fencing: só depois de promovido. Nunca antes,
+          nem na partida, nem se o primário nunca apareceu — quem tem como
+          confirmar a morte do outro espera a confirmação.
+        - Backup SEM agente: atende quando ninguém o alimenta neste instante.
+          É o modo de laboratório, de um servidor sozinho com a porta aberta.
 
-        - `promotor is None`: verdadeiro num backup sem `--agente-fencing`,
-          que é justamente um backup. Exatamente o contrário do pretendido.
-        - `porta_replicacao is None`: escutar a porta não é ser cópia. Um
-          servidor pode escutá-la e ser o único no ar — e aí ele parava de
-          vencer convite, de anular partida e de cobrar a jogada.
-
-        A pergunta certa é sobre o canal, não sobre a configuração: existe um
-        primário conectado neste instante? Se o canal cai, ou se esta máquina
-        foi promovida, o dono do estado passa a ser esta aqui.
+        Duas respostas erradas que já passaram por aqui: `promotor is None`
+        (verdadeiro num backup sem agente, ou seja, num backup) e
+        `porta_replicacao is None` (um servidor sozinho que só escuta a porta
+        parava de cobrar todos os prazos).
         """
-        if self.promotor is not None and self.promotor.promovido:
+        if self.porta_replicacao is None:
             return True
+        if self.promotor is not None:
+            return self.promotor.promovido
         return self.replica is None
+
+    def _recusar_jogador(self, conexao: Conexao):
+        """Backup em espera não recebe jogador: manda tentar o outro servidor.
+
+        Fechar logo depois é de propósito. O cliente trata a recusa como queda e
+        passa para o próximo endereço da lista, que é o primário.
+        """
+        self._log(f"recusei {conexao.endereco[0]}: sou o backup, mandei tentar o outro")
+        self._enviar(conexao, {"tipo": "nao_sou_primario",
+                               "msg": "este servidor é o backup; tente o outro"})
+        if conexao.jogador_id is not None and self.por_id.get(conexao.jogador_id) is conexao:
+            del self.por_id[conexao.jogador_id]
+        self._descartar(conexao)
+
+    def _virar_copia(self):
+        """Um primário acabou de se ligar a mim: o estado daqui vira cópia.
+
+        Quem estava jogando aqui (backup sem agente, atendendo sozinho) está
+        olhando um estado que o instantâneo do primário vai sobrescrever. Deixar
+        conectado seria mostrar uma sala parada para sempre, porque aplicar
+        instantâneo não transmite nada. Derrubar faz o cliente ir para o outro.
+        """
+        if not self.conexoes:
+            return
+        self._log(f"[repl] primário assumiu: mandando {len(self.conexoes)} "
+                  f"cliente(s) daqui para o outro servidor")
+        for conexao in list(self.conexoes.values()):
+            self._recusar_jogador(conexao)
+        self.por_id.clear()
+
+    def _assumir_atendimento(self):
+        """Acabei de virar o dono do estado: quem estava jogando não está aqui.
+
+        No failover ninguém está conectado a esta máquina — os clientes ainda
+        estão percebendo a queda do outro. Sem isto, os dois da partida ficavam
+        como 'jogando' sem conexão nenhuma: a partida não suspendia, o prazo de
+        reconexão nunca começava, e se um não voltasse o outro jogava contra um
+        fantasma. É a regra de sempre, "desconexão suspende", aplicada a quem
+        se desconectou por causa da queda.
+        """
+        ausentes = [ident for ident, j in self.sala.jogadores.items()
+                    if j.estado == JOGANDO and ident not in self.por_id]
+        for ident in ausentes:
+            self.sala.suspender(ident)
+        if ausentes:
+            self._log(f"assumi com {len(ausentes)} jogador(es) da partida fora: "
+                      f"suspensos, {self.sala.prazo_reconexao:.0f}s para voltarem")
+        self._transmitir_tudo()
 
     def _cobrar_jogada(self):
         """Desconta o relógio da vez e encerra a partida se ele zerar.
@@ -634,7 +715,23 @@ class Servidor:
                 if self.promotor and not self.promotor.promovido:
                     if self.promotor.promover():
                         self._fechar_replica()
-                        self._transmitir_tudo()
+                        self._assumir_atendimento()
+                elif self.promotor is None and self.replica is not None:
+                    # Sem agente não há a quem perguntar. Um primário que evapora
+                    # não manda FIN, então o canal ficaria aberto para sempre e
+                    # este backup nunca atenderia ninguém. Assume, e registra que
+                    # assumiu no escuro.
+                    self._log("[repl] sem agente de fencing: assumindo SEM "
+                              "confirmar que o primário morreu")
+                    self._fechar_replica()
+                    self._assumir_atendimento()
+
+        # Conexão que entrou na porta de replicação e não se identificou a tempo.
+        for pendente in list(self.pendentes.values()):
+            if time.monotonic() - pendente.desde > JANELA_DETECCAO_PAR:
+                self._log(f"[repl] conexão de {pendente.endereco[0]} descartada: "
+                          f"não se identificou em {JANELA_DETECCAO_PAR:.0f}s")
+                self._fechar_canal(pendente)
 
     def _aceitar_replica(self, ouvinte):
         sock, endereco = ouvinte.accept()
@@ -648,6 +745,18 @@ class Servidor:
             self._log(f"[repl] conexão de {endereco[0]} recusada "
                       f"(aceito apenas de {', '.join(sorted(self.ips_permitidos))})")
             sock.close()
+            return
+
+        # Com segredo, a conexão entra numa sala de espera e não toca em nada:
+        # não desloca o canal atual e não conta como sinal de vida do primário.
+        # Só depois de se identificar ela vira o canal. Se ela ocupasse o lugar
+        # antes, bastaria conectar e ficar calado para, 6 s depois, o backup
+        # concluir que o primário morreu.
+        if self.segredo:
+            sock.setblocking(False)
+            pendente = ConexaoReplica(sock, endereco, autenticada=False)
+            self.pendentes[sock] = pendente
+            self.seletor.register(sock, selectors.EVENT_READ, pendente)
             return
 
         # Defesa em profundidade: um canal que deu sinal de vida agora há pouco não
@@ -669,6 +778,65 @@ class Servidor:
         self.ultimo_contato_par = time.monotonic()
         self.avisou_par_mudo = False
         self._log(f"[repl] primário conectado de {endereco[0]}")
+        self._virar_copia()
+
+    def _identificar(self, conexao: ConexaoReplica, mensagem: dict) -> bool:
+        """Primeira mensagem de uma conexão pendente: tem de ser o segredo."""
+        segredo = mensagem.get("segredo")
+        confere = (mensagem.get("tipo") == "ola" and isinstance(segredo, str)
+                   and hmac.compare_digest(segredo.encode(), self.segredo.encode()))
+        if not confere:
+            self._log(f"[repl] conexão de {conexao.endereco[0]} recusada: "
+                      f"não se identificou com o segredo")
+            self._fechar_canal(conexao)
+            return False
+
+        self.pendentes.pop(conexao.sock, None)
+        # Identificado, pode deslocar o canal antigo: é o primário que reiniciou
+        # e voltou, e não alguém que só sabe o endereço.
+        if self.replica is not None:
+            self._log("[repl] primário reconectou, descartando canal antigo")
+            self._fechar_replica()
+        conexao.autenticada = True
+        self.replica = conexao
+        self.ultimo_contato_par = time.monotonic()
+        self.avisou_par_mudo = False
+        self._log(f"[repl] primário conectado de {conexao.endereco[0]} "
+                  f"(identificado pelo segredo)")
+        self._virar_copia()
+        return True
+
+    def _fechar_canal(self, conexao: ConexaoReplica):
+        if conexao is self.replica:
+            self._fechar_replica()
+            return
+        self.pendentes.pop(conexao.sock, None)
+        try:
+            self.seletor.unregister(conexao.sock)
+        except (KeyError, ValueError):
+            pass
+        try:
+            conexao.sock.close()
+        except OSError:
+            pass
+
+    def _resumo_da_copia(self) -> str:
+        """Uma linha para o terminal do backup mostrar a replicação acontecendo.
+
+        Substitui o 'espião' do roteiro antigo, que conectava um cliente no
+        backup para ver a sala. Com o backup recusando jogador, a prova de que
+        a cópia chega passa a ser esta linha, a cada lance.
+        """
+        def nome(i):
+            return self.sala.jogadores[i].nome if i in self.sala.jogadores else "?"
+
+        texto = f"cópia atualizada: {len(self.sala.jogadores)} na sala"
+        if self.partida and self.dupla:
+            nomes = " x ".join(nome(i) for i in self.dupla)
+            erros = ", ".join(f"{nome(i)} {self.partida.erros[i]}" for i in self.dupla)
+            texto += (f"; partida {nomes}, painel {self.partida.painel()}, "
+                      f"erros {erros}, vez de {nome(self.partida.turno)}")
+        return texto
 
     def _fechar_replica(self):
         if self.replica is None:
@@ -690,24 +858,37 @@ class Servidor:
             dados = b""
 
         if not dados:
-            self._log("[repl] canal com o primário caiu")
-            self._fechar_replica()
+            if conexao.autenticada:
+                self._log("[repl] canal com o primário caiu")
+            era_o_canal = conexao is self.replica
+            self._fechar_canal(conexao)
+            # Sem agente, perder o canal já é virar dono (ver _sou_quem_atende).
+            # Com agente, nada muda aqui: só a promoção, depois do silêncio,
+            # passa o atendimento para esta máquina.
+            if era_o_canal and self.promotor is None:
+                self._assumir_atendimento()
             return
 
-        self.ultimo_contato_par = time.monotonic()
-        self.avisou_par_mudo = False
+        # Só o canal identificado conta como sinal de vida do primário. Uma
+        # conexão pendente mandando bytes não pode adiar a detecção de queda.
+        if conexao.autenticada:
+            self.ultimo_contato_par = time.monotonic()
+            self.avisou_par_mudo = False
         try:
             mensagens = conexao.enquadrador.alimentar(dados)
         except (BufferExcedido, ValueError) as erro:
             self._log(f"[repl] mensagem malformada: {erro}")
-            self._fechar_replica()
+            self._fechar_canal(conexao)
             return
 
         for m in mensagens:
-            if m.get("tipo") == "estado":
-                # A porta de replicação não tem autenticação, então qualquer um na
-                # rede alcança este caminho. Um `{"tipo":"estado"}` sem a chave
-                # `dados` derrubava o servidor inteiro com uma linha.
+            if not conexao.autenticada:
+                if not self._identificar(conexao, m):
+                    return
+            elif m.get("tipo") == "estado":
+                # Sem --segredo, a porta de replicação não tem autenticação e
+                # qualquer um na rede alcança este caminho. Um `{"tipo":"estado"}`
+                # sem a chave `dados` derrubava o servidor inteiro com uma linha.
                 try:
                     dados = m["dados"]
                     if not isinstance(dados, dict):
@@ -716,13 +897,14 @@ class Servidor:
                 except (KeyError, TypeError, ValueError, AttributeError) as erro:
                     self._log(f"[repl] estado inválido descartado "
                               f"({type(erro).__name__}: {erro})")
-                    self._fechar_replica()
+                    self._fechar_canal(conexao)
                     return
+                self._log(f"[repl] {self._resumo_da_copia()}")
 
             try:
                 conexao.sock.sendall(empacotar({"tipo": "ok", "seq": m.get("seq")}))
             except OSError:
-                self._fechar_replica()
+                self._fechar_canal(conexao)
                 return
 
     def _transmitir(self, mensagem: dict):
@@ -820,14 +1002,19 @@ def main():
                         help="endereço de replicação do backup (quem passa isto é o primário)")
     parser.add_argument("--porta-replicacao", type=int,
                         help="porta onde receber estado do primário (quem passa isto é o backup)")
+    parser.add_argument("--segredo", metavar="TEXTO",
+                        help="segredo compartilhado da replicação, IGUAL nos dois "
+                             "servidores; o backup só aceita como primário quem o diz")
     parser.add_argument("--ip-par", metavar="IP",
-                        help="único endereço aceito na porta de replicação; sem isto, "
-                             "qualquer um na rede pode se passar pelo primário")
+                        help="único endereço aceito na porta de replicação; não serve "
+                             "com as VMs atrás de NAT (tudo chega do gateway), use --segredo")
     parser.add_argument("--agente-fencing", metavar="HOST:PORTA",
                         help="agente de fencing no host; habilita promoção automática")
     parser.add_argument("--vm-par", default="VM1",
                         help="nome da VM do primário, para o fencing desligar")
-    parser.add_argument("--ip-virtual", default="192.168.56.10/24")
+    parser.add_argument("--ip-virtual", default=None,
+                        help="IP flutuante a assumir na promoção (ex: 192.168.56.10/24). "
+                             "Sem isto, os clientes chegam pela lista de servidores")
     parser.add_argument("--interface", default="proj0")
     parser.add_argument("--script-assumir",
                         default=str(Path(__file__).parent / "infra" / "assumir_ip.sh"))
@@ -840,7 +1027,8 @@ def main():
 
     servidor = Servidor(args.nome, args.host, args.porta,
                         carregar_palavras(args.palavras), args.prazo_reconexao,
-                        par, args.porta_replicacao, args.ip_par, args.prazo_jogada)
+                        par, args.porta_replicacao, args.ip_par, args.prazo_jogada,
+                        args.segredo)
 
     # O IP virtual acompanha quem é primário, então ele também é origem legítima
     # de replicação — e o backup já o conhece, sem precisar de outro parâmetro.

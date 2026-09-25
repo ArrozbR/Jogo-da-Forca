@@ -81,10 +81,17 @@ class Promotor:
             self.log(f"fencing NÃO confirmado ({motivo}) — assumindo mesmo assim; "
                      f"risco de split-brain se o primário estiver vivo e isolado")
 
-        if not self._assumir_ip():
+        # Sem IP virtual, promover é só começar a atender: os clientes já
+        # conhecem este endereço pela lista e vêm sozinhos. É o modo usado com
+        # as máquinas em redes que não são nossas, onde anunciar um IP que era
+        # de outro aparelho seria bloqueado como ARP spoofing.
+        if not self.ip_virtual:
+            self.log("sem IP virtual: os clientes chegam pela lista de servidores")
+        elif not self._assumir_ip():
             self.log("promoção abortada: não foi possível assumir o IP virtual")
             return False
 
         self.promovido = True
-        self.log("PROMOÇÃO concluída — este servidor agora atende o IP virtual")
+        self.log("PROMOÇÃO concluída — este servidor agora atende "
+                 + ("o IP virtual" if self.ip_virtual else "os jogadores"))
         return True

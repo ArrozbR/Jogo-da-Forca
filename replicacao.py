@@ -22,8 +22,9 @@ class Replicador:
     """
 
     def __init__(self, host: str, porta: int, timeout: float = TIMEOUT_REPLICACAO,
-                 log=None):
+                 log=None, segredo: str | None = None):
         self.host = host
+        self.segredo = segredo
         self.porta = porta
         self.timeout = timeout
         self.log = log or (lambda _: None)
@@ -45,12 +46,20 @@ class Replicador:
             self.sock.settimeout(self.timeout)
             self.enquadrador = Enquadrador()
             self.log(f"replicação ligada a {self.host}:{self.porta}")
-            return True
         except OSError as erro:
             self.sock = None
             self.proxima_tentativa = time.monotonic() + INTERVALO_RETENTATIVA
             self.log(f"backup inacessível ({erro})")
             return False
+
+        # Primeira mensagem do canal: quem sou. O backup com segredo mantém a
+        # conexão numa sala de espera até ouvir isto, e a derruba se não ouvir.
+        # Se a troca falhar, _trocar já fechou e agendou nova tentativa.
+        if self.segredo is not None:
+            if not self._trocar({"tipo": "ola", "segredo": self.segredo}):
+                return False
+            self.log("backup aceitou o segredo")
+        return True
 
     def manutencao(self) -> bool:
         """Retenta em segundo plano. True quando o backup acabou de voltar.

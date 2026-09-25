@@ -1,10 +1,13 @@
-"""Sonda o IP virtual e relata qual servidor atende.
+"""Sonda os servidores e relata qual deles atende.
 
 Instrumento da etapa 0: abre uma conexão nova a cada ciclo, que é exatamente o
 que um cliente reconectando faz, e mede quanto tempo o serviço fica sem atender
-durante o takeover.
+durante o failover.
 
-    python sonda.py --host 192.168.0.10
+Com a lista de servidores, "no ar" quer dizer "alguém da lista atende". O backup
+em espera responde ao ping, mas avisa que não atende, e por isso não conta.
+
+    py sonda.py --host 192.168.43.20,192.168.43.31
 """
 
 import argparse
@@ -27,23 +30,45 @@ def sondar(host: str, porta: int, limite: float) -> str | None:
                 if not dados:
                     return None
                 for mensagem in enquadrador.alimentar(dados):
-                    if mensagem.get("servidor"):
-                        return mensagem["servidor"]
+                    if mensagem.get("tipo") != "pong":
+                        continue
+                    # Servidor antigo não manda 'atendendo'; ausente conta como sim.
+                    if mensagem.get("atendendo") is False:
+                        return None
+                    return mensagem.get("servidor") or f"{host}:{porta}"
     except (OSError, ValueError):
         return None
     return None
 
 
+def interpretar(texto: str, porta_padrao: int) -> list[tuple[str, int]]:
+    enderecos = []
+    for parte in texto.split(","):
+        parte = parte.strip()
+        if not parte:
+            continue
+        host, separador, porta = parte.rpartition(":")
+        if separador and porta.isdigit():
+            enderecos.append((host, int(porta)))
+        else:
+            enderecos.append((parte, porta_padrao))
+    return enderecos
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Sonda o IP virtual do jogo da forca")
-    parser.add_argument("--host", required=True, help="IP virtual (ex: 192.168.0.10)")
+    parser = argparse.ArgumentParser(description="Sonda os servidores do jogo da forca")
+    parser.add_argument("--host", required=True,
+                        help="um endereço ou vários separados por vírgula (host ou host:porta)")
     parser.add_argument("--porta", type=int, default=5000)
     parser.add_argument("--intervalo", type=float, default=0.5)
     parser.add_argument("--limite", type=float, default=1.0, help="timeout por sondagem")
     args = parser.parse_args()
 
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    print(f"sondando {args.host}:{args.porta} a cada {args.intervalo}s — Ctrl+C encerra\n")
+    enderecos = interpretar(args.host, args.porta)
+    lista = ", ".join(f"{h}:{p}" for h, p in enderecos)
+    print(f"sondando {lista} a cada {args.intervalo}s — Ctrl+C encerra")
+    print()
 
     anterior = "inicio"
     ultimo_ok = None
@@ -51,7 +76,8 @@ def main():
 
     try:
         while True:
-            atual = sondar(args.host, args.porta, args.limite)
+            atual = next((nome for nome in (sondar(h, p, args.limite)
+                                            for h, p in enderecos) if nome), None)
             agora = time.monotonic()
             etiqueta = atual or "SEM RESPOSTA"
 
@@ -69,7 +95,8 @@ def main():
 
             time.sleep(args.intervalo)
     except KeyboardInterrupt:
-        print("\n--- resumo ---")
+        print()
+        print("--- resumo ---")
         if not quedas:
             print("nenhuma troca de servidor observada")
         for de, para, fora in quedas:

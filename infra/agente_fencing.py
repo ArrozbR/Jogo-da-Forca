@@ -27,6 +27,13 @@ from pathlib import Path
 VBOXMANAGE = Path(r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe")
 PERMITIDAS = {"VM1", "VM2"}
 
+# Estados em que a VM não executa nada. O fencing quer "o outro não está
+# rodando", e não "o outro está em poweroff": uma VM salva (suspensa em disco)
+# ou abortada também está parada. Só com "poweroff" o agente tentava desligar
+# uma VM salva, o comando falhava, e ele respondia "não confirmei" — fazendo o
+# backup assumir com aviso de split-brain sem risco nenhum de verdade.
+PARADA = {"poweroff", "saved", "aborted"}
+
 # Curto de propósito. Este é o prazo para o pedido CHEGAR, não para a VM
 # morrer: quem conecta e não fala nada solta a linha em 5s em vez de 30.
 TIMEOUT_PEDIDO = 5.0
@@ -53,15 +60,15 @@ def desligar(nome: str) -> tuple[bool, str]:
         return False, f"vm '{nome}' não está na lista permitida"
 
     antes = estado_da_vm(nome)
-    if antes == "poweroff":
-        return True, "já estava desligada"
+    if antes in PARADA:
+        return True, f"já não estava rodando ({antes})"
 
     subprocess.run([str(VBOXMANAGE), "controlvm", nome, "poweroff"],
                    capture_output=True, text=True, timeout=30)
 
     # Confirmar importa mais que mandar: um comando enviado não é uma máquina morta.
     for _ in range(20):
-        if estado_da_vm(nome) == "poweroff":
+        if estado_da_vm(nome) in PARADA:
             return True, "desligamento confirmado"
         time.sleep(0.25)
     return False, f"não confirmou o desligamento (estado: {estado_da_vm(nome)})"
