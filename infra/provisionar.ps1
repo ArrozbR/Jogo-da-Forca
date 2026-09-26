@@ -14,16 +14,19 @@ param(
 
 $ErrorActionPreference = "Continue"
 $enderecos = @{ "VM1" = "192.168.56.11"; "VM2" = "192.168.56.12" }
-$vms = @{}
-foreach ($v in $Vms) { $vms[$v] = $enderecos[$v] }
+# $alvos, e nao $vms: no PowerShell nome de variavel nao diferencia maiusculas,
+# entao $vms E o parametro $Vms. A versao anterior criava a tabela com esse nome,
+# apagava a lista pedida, nao copiava nada e ainda dizia "concluido".
+$alvos = @{}
+foreach ($v in $Vms) { $alvos[$v] = $enderecos[$v] }
 $opcoes = @("-i", $Chave, "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10")
 
 function Remoto([string]$ip, [string]$comando) {
     & ssh @opcoes "$Usuario@$ip" $comando 2>&1
 }
 
-foreach ($nome in $vms.Keys | Sort-Object) {
-    $ip = $vms[$nome]
+foreach ($nome in $alvos.Keys | Sort-Object) {
+    $ip = $alvos[$nome]
     Write-Host "`n=== $nome ($ip) ===" -ForegroundColor Cyan
 
     $quem = Remoto $ip "hostname; ip -4 -brief addr show scope global; python3 --version"
@@ -50,4 +53,4 @@ foreach ($nome in $vms.Keys | Sort-Object) {
     Remoto $ip "chmod +x ~/JogoDaForca/infra/*.sh" | Out-Null
 }
 
-Write-Host "`nProvisionamento concluido nas duas VMs." -ForegroundColor Green
+Write-Host "`nProvisionamento concluido: $(($alvos.Keys | Sort-Object) -join ', ')." -ForegroundColor Green

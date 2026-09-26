@@ -173,9 +173,21 @@ class Servidor:
         self.seletor.register(sock, selectors.EVENT_READ, conexao)
 
     def _ler(self, conexao: Conexao):
+        # O select devolve um LOTE de sockets prontos. Tratar o primeiro pode
+        # fechar outro do mesmo lote — a queda de A avisa a sala, o envio para B
+        # falha, e B é descartado ali mesmo. Sem esta guarda o laço chegava em B
+        # e chamava recv num socket fechado: WinError 10038 fora de qualquer
+        # try, e o servidor morria. Intermitente, porque depende de quantas
+        # quedas caem no mesmo lote; apareceu em 4 de 11 rodadas de 150
+        # conexões caindo juntas.
+        if conexao.sock not in self.conexoes:
+            return
         try:
             dados = conexao.sock.recv(4096)
-        except ConnectionError:
+        except OSError:
+            # OSError, e não só ConnectionError: socket inválido, rede
+            # desligada e afins também chegam aqui, e nenhum deles pode
+            # derrubar o servidor inteiro.
             self._encerrar(conexao, "conexão perdida")
             return
 
@@ -852,9 +864,13 @@ class Servidor:
         self.replica = None
 
     def _ler_replica(self, conexao: ConexaoReplica):
+        # Mesma guarda do _ler: no mesmo lote do select, identificar um primário
+        # novo fecha o canal antigo, que pode estar logo adiante no lote.
+        if conexao is not self.replica and conexao.sock not in self.pendentes:
+            return
         try:
             dados = conexao.sock.recv(65536)
-        except ConnectionError:
+        except OSError:
             dados = b""
 
         if not dados:
